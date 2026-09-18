@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Ping Render Service
         env:
-          SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL || 'https://gridwise-bup-2026.onrender.com' }}
+          SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL || 'https://gridwise-bup-2026-94ht.onrender.com' }}
         run: |
           echo "Sending keep-alive heartbeat ping to $SERVICE_URL/health..."
           HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$SERVICE_URL/health" || echo "FAILED")

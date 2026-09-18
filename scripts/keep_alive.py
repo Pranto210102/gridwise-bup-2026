@@ -2,7 +2,7 @@ import time
 import sys
 import httpx
 
-TARGET_URL = sys.argv[1] if len(sys.argv) > 1 else "https://gridwise-bup-2026.onrender.com/health"
+TARGET_URL = sys.argv[1] if len(sys.argv) > 1 else "https://gridwise-bup-2026-94ht.onrender.com/health"
 INTERVAL_SECONDS = 300  # Ping every 5 minutes (Render sleep timeout is 15 minutes)
 
 print("=" * 65)

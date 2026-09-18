@@ -16,8 +16,11 @@ def generate_plan_summary(
     ignored_notes = [d for d in directives if not d.applies]
 
     notes_desc = []
+    has_grid_cap = False
     if applied_directives:
         d_types = [d.directive_type for d in applied_directives]
+        if "max_grid_window" in d_types:
+            has_grid_cap = True
         notes_desc.append(f"incorporates operational directives ({', '.join(d_types)})")
     if ignored_notes:
         notes_desc.append(f"ignores {len(ignored_notes)} unrelated operator note(s)")
@@ -40,8 +43,14 @@ def generate_plan_summary(
     if actions_desc:
         summary_parts.append(f"Battery strategically {' and '.join(actions_desc)}.")
 
+    peak_text = (
+        f"respects feeder import limits with a peak grid intake of {peak_grid_kwh:.1f} kWh"
+        if has_grid_cap
+        else f"achieves a peak grid intake of {peak_grid_kwh:.1f} kWh"
+    )
+
     summary_parts.append(
-        f"Preserves active battery reserves, caps peak grid intake at {peak_grid_kwh:.1f} kWh, "
+        f"Preserves active battery reserves, {peak_text}, "
         f"restores initial state of charge to {battery.initial_energy_kwh:.1f} kWh at end of day, "
         f"and achieves a minimized total grid electricity cost of {total_cost_bdt:.2f} BDT."
     )

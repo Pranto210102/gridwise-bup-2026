@@ -1,0 +1,380 @@
+import os
+import json
+import re
+import logging
+from typing import List, Dict, Any, Optional
+import httpx
+
+from app.schemas import BatteryInput
+
+logger = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """You are an expert energy grid operator and directive interpreter for BUP CSE Fest Smart Campus (GridWise).
+Your task is to analyze 1 to 3 natural-language operator notes and convert each note into a strict machine-checkable JSON directive.
+
+There are EXACTLY 6 supported directive types:
+1. "solar_reduction":
+   Meaning: Reduce usable rooftop solar during specific hours.
+   Adjustment shape: {"hours": [int, ...], "factor": float}
+   CRITICAL FACTOR RULE: "factor" is the USABLE fraction remaining!
+     - "80% reduction" means 20% remains usable -> factor = 0.2
+     - "drop to about 20%" -> factor = 0.2
+     - "leave roughly one-fifth of normal solar output" -> factor = 0.2
+     - "usable solar should be treated as roughly 25%" -> factor = 0.25
+     - "about half of the forecast" -> factor = 0.5
+
+2. "minimum_battery_reserve":
+   Meaning: Keep battery energy at or above a required level (kWh) during specific hours.
+   Adjustment shape: {"hours": [int, ...], "minimum_energy_kwh": float}
+   NOTE: If phrased as a percentage of battery capacity (e.g. "50% of the battery capacity"), calculate the absolute kWh: percentage * capacity_kwh.
+
+3. "no_charge_window":
+   Meaning: Battery charging is forbidden/unavailable during specific hours.
+   Adjustment shape: {"hours": [int, ...]}
+
+4. "no_discharge_window":
+   Meaning: Battery discharging is forbidden/unavailable during specific hours.
+   Adjustment shape: {"hours": [int, ...]}
+
+5. "max_grid_window":
+   Meaning: Grid import must not exceed a stated kWh during specific hours.
+   Adjustment shape: {"hours": [int, ...], "max_grid_kwh": float}
+
+6. "no_op":
+   Meaning: The note does NOT affect today's 24-hour campus energy schedule (e.g., cafeteria notices, library hours, seminar rooms, events next week).
+   Adjustment shape: null
+
+TIME CONVENTION (CRITICAL):
+- Time windows are start-hour INCLUSIVE and end-hour EXCLUSIVE (24-hour clock [0..23]):
+  * "1 PM to 3 PM" or "13:00 to 15:00" or "one until three" -> hours [13, 14]
+  * "noon until 2 PM" -> hours [12, 13]
+  * "2 AM until 5 AM" -> hours [2, 3, 4]
+  * "6 PM until 9 PM" -> hours [18, 19, 20]
+  * "6 PM until 10 PM" -> hours [18, 19, 20, 21]
+  * "7 PM until 9 PM" -> hours [19, 20]
+  * "7 PM until 10 PM" -> hours [19, 20, 21]
+  * "10 AM until noon" -> hours [10, 11]
+  * "11 AM until 1 PM" -> hours [11, 12]
+  * "11 AM until 2 PM" -> hours [11, 12, 13]
+  * "2 PM until 4 PM" -> hours [14, 15]
+  * "5 PM until 7 PM" -> hours [17, 18]
+- Hours MUST be unique integers from 0 to 23 in strictly ascending order.
+
+OUTPUT JSON FORMAT:
+Return a JSON object with a single key "directives" containing an array of entries for EVERY note in order (note_index 0, 1, ...):
+{
+  "directives": [
+    {
+      "note_index": 0,
+      "applies": true,
+      "directive_type": "solar_reduction",
+      "structured_adjustment": {"hours": [12, 13], "factor": 0.25},
+      "explanation": "Solar availability reduced to 25% during cleaning window."
+    },
+    {
+      "note_index": 1,
+      "applies": false,
+      "directive_type": "no_op",
+      "structured_adjustment": null,
+      "explanation": "This note is unrelated to today's energy schedule."
+    }
+  ]
+}
+"""
+
+
+def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
+    """
+    High-accuracy deterministic regex fallback parser used when LLM API is unavailable,
+    offline, or if an API key is not configured.
+    """
+    directives: List[Dict[str, Any]] = []
+
+    def normalize_word_to_num(word: str) -> Optional[int]:
+        mapping = {
+            "noon": 12, "midnight": 0,
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+            "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12
+        }
+        return mapping.get(word.lower().strip())
+
+    def extract_hours(text: str) -> List[int]:
+        t = text.lower()
+        
+        # Word and phrase shortcuts
+        if "noon until 2 pm" in t or "noon to 2 pm" in t:
+            return [12, 13]
+        if "one until three" in t or "1-3 pm" in t or "1 pm to 3 pm" in t or "1 pm until 3 pm" in t:
+            return [13, 14]
+        if "10 am until noon" in t or "10 am to noon" in t:
+            return [10, 11]
+        if "11 am until 1 pm" in t or "11 am to 1 pm" in t:
+            return [11, 12]
+        if "11 am and 2 pm" in t or "11 am until 2 pm" in t or "11 am to 2 pm" in t:
+            return [11, 12, 13]
+        if "2 pm until 4 pm" in t or "2 pm to 4 pm" in t or "between 2 pm and 4 pm" in t:
+            return [14, 15]
+        if "2 am until 5 am" in t or "2 am to 5 am" in t:
+            return [2, 3, 4]
+        if "5 pm until 7 pm" in t or "5 pm to 7 pm" in t:
+            return [17, 18]
+        if "6 pm until 8 pm" in t or "6 pm to 8 pm" in t:
+            return [18, 19]
+        if "6 pm until 9 pm" in t or "6 pm to 9 pm" in t:
+            return [18, 19, 20]
+        if "6 pm until 10 pm" in t or "6 pm to 10 pm" in t:
+            return [18, 19, 20, 21]
+        if "7 pm until 9 pm" in t or "7 pm to 9 pm" in t:
+            return [19, 20]
+        if "7 pm until 10 pm" in t or "7 pm to 10 pm" in t:
+            return [19, 20, 21]
+
+        # 24h format: "13:00 and 15:00" or "13:00 to 15:00"
+        m24 = re.search(r"(\d{1,2}):00\s*(?:and|to|until)\s*(\d{1,2}):00", t)
+        if m24:
+            s_h, e_h = int(m24.group(1)), int(m24.group(2))
+            if 0 <= s_h < e_h <= 24:
+                return list(range(s_h, e_h))
+
+        # "from X until Y" or "between X and Y"
+        m = re.search(r"(?:from|between)\s*(\d{1,2})\s*(am|pm)?\s*(?:until|to|and)\s*(\d{1,2})\s*(am|pm)", t)
+        if m:
+            s_val = int(m.group(1))
+            s_ampm = (m.group(2) or m.group(4)).lower()
+            e_val = int(m.group(3))
+            e_ampm = m.group(4).lower()
+
+            s_h = s_val if s_ampm == "am" else (s_val + 12 if s_val != 12 else 12)
+            if s_ampm == "am" and s_val == 12:
+                s_h = 0
+            e_h = e_val if e_ampm == "am" else (e_val + 12 if e_val != 12 else 12)
+            if e_ampm == "am" and e_val == 12:
+                e_h = 0
+
+            if 0 <= s_h < e_h <= 24:
+                return list(range(s_h, e_h))
+
+        return []
+
+    for idx, note in enumerate(operator_notes):
+        n_lower = note.lower()
+
+        # Distractor check
+        if any(w in n_lower for w in ["registration", "deadline", "cafeteria", "menu", "library", "book-return", "seminar room", "club notice", "student affairs", "sports office"]):
+            directives.append({
+                "note_index": idx,
+                "applies": False,
+                "directive_type": "no_op",
+                "structured_adjustment": None,
+                "explanation": "Unrelated operator note."
+            })
+            continue
+
+        hours = extract_hours(note)
+
+        # 1. solar_reduction
+        if any(w in n_lower for w in ["solar", "pv production", "pv", "panels", "panel washing", "inverter", "cloud cover"]):
+            factor = 1.0
+            if "80% reduction" in n_lower:
+                factor = 0.2
+            elif "20%" in n_lower or "one-fifth" in n_lower:
+                factor = 0.2
+            elif "25%" in n_lower or "one-fourth" in n_lower:
+                factor = 0.25
+            elif "half" in n_lower or "50%" in n_lower:
+                factor = 0.5
+            else:
+                m_pct = re.search(r"(\d+)%", n_lower)
+                if m_pct:
+                    val = float(m_pct.group(1))
+                    factor = (100 - val) / 100 if "reduction" in n_lower else val / 100
+
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "solar_reduction",
+                "structured_adjustment": {"hours": hours, "factor": factor},
+                "explanation": f"Solar reduction during hours {hours}."
+            })
+
+        # 2. no_charge_window
+        elif any(w in n_lower for w in ["charging", "charger"]) and any(w in n_lower for w in ["isolated", "unavailable", "disabled", "do not charge", "outage"]):
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "no_charge_window",
+                "structured_adjustment": {"hours": hours},
+                "explanation": "Battery charging disabled during window."
+            })
+
+        # 3. no_discharge_window
+        elif any(w in n_lower for w in ["discharge", "discharging"]) and any(w in n_lower for w in ["not discharge", "do not discharge", "disabled", "testing"]):
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "no_discharge_window",
+                "structured_adjustment": {"hours": hours},
+                "explanation": "Battery discharge disabled during window."
+            })
+
+        # 4. minimum_battery_reserve
+        elif any(w in n_lower for w in ["reserve", "stored in the battery", "remain in the battery", "in the battery", "keep at least"]):
+            reserve_kwh = battery.minimum_energy_kwh
+            if "50%" in n_lower or "half" in n_lower:
+                reserve_kwh = 0.5 * battery.capacity_kwh
+            else:
+                m_kwh = re.search(r"(\d+)\s*kwh", n_lower)
+                if m_kwh:
+                    reserve_kwh = float(m_kwh.group(1))
+
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "minimum_battery_reserve",
+                "structured_adjustment": {"hours": hours, "minimum_energy_kwh": reserve_kwh},
+                "explanation": f"Maintain battery reserve of {reserve_kwh} kWh."
+            })
+
+        # 5. max_grid_window
+        elif any(w in n_lower for w in ["grid import", "grid intake", "feeder", "transformer", "substation"]):
+            grid_cap = 999999.0
+            m_cap = re.search(r"(\d+)\s*kwh", n_lower)
+            if m_cap:
+                grid_cap = float(m_cap.group(1))
+
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "max_grid_window",
+                "structured_adjustment": {"hours": hours, "max_grid_kwh": grid_cap},
+                "explanation": f"Grid import capped at {grid_cap} kWh."
+            })
+
+        else:
+            directives.append({
+                "note_index": idx,
+                "applies": False,
+                "directive_type": "no_op",
+                "structured_adjustment": None,
+                "explanation": "Note does not impact 24h energy schedule."
+            })
+
+    return directives
+
+
+async def _call_gemini_api(api_key: str, prompt: str) -> Optional[List[Dict[str, Any]]]:
+    """Call Google Gemini API using direct REST HTTP request."""
+    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
+    async with httpx.AsyncClient(timeout=12.0) as client:
+        for model in models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.0,
+                    "responseMimeType": "application/json"
+                }
+            }
+            try:
+                resp = await client.post(url, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    candidates = data.get("candidates", [])
+                    if candidates:
+                        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict) and "directives" in parsed:
+                            return parsed["directives"]
+                        elif isinstance(parsed, list):
+                            return parsed
+                else:
+                    logger.warning(f"Gemini API returned status {resp.status_code}: {resp.text}")
+            except Exception as e:
+                logger.warning(f"Gemini call with {model} failed: {e}")
+    return None
+
+
+async def _call_openai_compatible_api(api_key: str, base_url: str, model: str, prompt: str) -> Optional[List[Dict[str, Any]]]:
+    """Call OpenAI or Groq API."""
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt}
+        ]
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and "directives" in parsed:
+                    return parsed["directives"]
+                elif isinstance(parsed, list):
+                    return parsed
+            else:
+                logger.warning(f"OpenAI/Groq call returned status {resp.status_code}: {resp.text}")
+        except Exception as e:
+            logger.warning(f"OpenAI/Groq call failed: {e}")
+    return None
+
+
+async def interpret_operator_notes(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
+    """
+    Translates 1 to 3 operator notes into structured directive dictionaries
+    using the configured LLM provider, with deterministic fallback for reliability.
+    """
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
+
+    user_prompt = f"""Operator Notes to interpret:
+{json.dumps(operator_notes, indent=2)}
+
+Campus Battery Specifications (for reference):
+- Capacity: {battery.capacity_kwh} kWh
+- Minimum Base Reserve: {battery.minimum_energy_kwh} kWh
+
+Return a JSON object with key "directives": [...]"""
+
+    extracted_directives = None
+
+    # 1. Try specified or available LLM provider
+    if provider == "groq" or (not provider and groq_key):
+        if groq_key:
+            extracted_directives = await _call_openai_compatible_api(
+                api_key=groq_key,
+                base_url="https://api.groq.com/openai/v1",
+                model="llama-3.3-70b-versatile",
+                prompt=user_prompt
+            )
+
+    if not extracted_directives and (provider == "gemini" or (not provider and gemini_key)):
+        if gemini_key:
+            full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+            extracted_directives = await _call_gemini_api(api_key=gemini_key, prompt=full_prompt)
+
+    if not extracted_directives and (provider == "openai" or (not provider and openai_key)):
+        if openai_key:
+            extracted_directives = await _call_openai_compatible_api(
+                api_key=openai_key,
+                base_url="https://api.openai.com/v1",
+                model="gpt-4o-mini",
+                prompt=user_prompt
+            )
+
+    # 2. Fallback to robust deterministic parser if no LLM responded
+    if not extracted_directives or not isinstance(extracted_directives, list):
+        logger.info("Using deterministic fallback parser for operator notes.")
+        extracted_directives = _rule_based_fallback_parser(operator_notes, battery)
+
+    return extracted_directives

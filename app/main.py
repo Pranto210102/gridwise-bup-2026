@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
@@ -78,10 +79,10 @@ async def get_health():
 @app.post("/optimize-energy", response_model=OptimizationResponse, tags=["Optimization"])
 async def optimize_energy(req: ScenarioRequest):
     """
-    Main endpoint:
-    1. Interprets natural-language operator notes using LLM
+    Main endpoint supporting high concurrency:
+    1. Interprets natural-language operator notes using LLM with caching and multi-key rotation
     2. Deterministically validates and repairs directives via guardrails
-    3. Executes 24-hour MILP mathematical optimization
+    3. Executes 24-hour MILP mathematical optimization in worker thread
     4. Returns exact machine-checkable interpretation and optimal hourly plan
     """
     # Step 1: LLM interpretation of operator notes
@@ -97,8 +98,9 @@ async def optimize_energy(req: ScenarioRequest):
         battery=req.battery
     )
 
-    # Step 3: Mathematical MILP optimization
-    hourly_plan, total_grid, total_cost, peak_grid = solve_energy_schedule(
+    # Step 3: Mathematical MILP optimization offloaded to thread to prevent event-loop blocking
+    hourly_plan, total_grid, total_cost, peak_grid = await asyncio.to_thread(
+        solve_energy_schedule,
         hours=req.hours,
         battery=req.battery,
         directives=validated_directives

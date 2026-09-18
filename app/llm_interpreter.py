@@ -2,12 +2,17 @@ import os
 import json
 import re
 import logging
+import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
 
 from app.schemas import BatteryInput
 
 logger = logging.getLogger(__name__)
+
+# Global in-memory cache for concurrent & repeated note interpretations
+_INTERPRETATION_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_KEY_INDEX = 0
 
 SYSTEM_PROMPT = """You are an expert energy grid operator and directive interpreter for BUP CSE Fest Smart Campus (GridWise).
 Your task is to analyze 1 to 3 natural-language operator notes and convert each note into a strict machine-checkable JSON directive.
@@ -86,7 +91,7 @@ Return a JSON object with key "directives" containing an array of entries for EV
 def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
     """
     High-accuracy deterministic regex fallback parser used when LLM APIs are unavailable,
-    offline, or during failovers.
+    offline, or during network failovers.
     """
     directives: List[Dict[str, Any]] = []
 
@@ -137,7 +142,7 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
                 s_h = 0
             e_h = end_val if end_ampm == "am" else (end_val + 12 if end_val != 12 else 12)
             if end_ampm == "am" and end_val == 12:
-                e_h = 0
+                end_h = 0
 
             if 0 <= s_h < e_h <= 24:
                 return list(range(s_h, e_h))
@@ -259,7 +264,6 @@ def _normalize_llm_items(items: List[Dict[str, Any]], expected_count: int) -> Li
         n_idx = item.get("note_index", idx)
         d_type = item.get("directive_type") or item.get("type", "no_op")
         
-        # If model returned keys flat or in structured_adjustment
         adj = item.get("structured_adjustment")
         if adj is None and d_type != "no_op":
             adj = {}
@@ -289,7 +293,6 @@ async def _call_gemini_with_key(api_key: str, prompt: str) -> Optional[List[Dict
     """Call Google Gemini API using ultra-low latency flash-lite models."""
     models = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
     
-    # 3.0s timeout per call ensures response is fast and well under 5.0s p95 threshold
     async with httpx.AsyncClient(timeout=3.0) as client:
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
@@ -314,10 +317,10 @@ async def _call_gemini_with_key(api_key: str, prompt: str) -> Optional[List[Dict
                             return _normalize_llm_items(parsed, 0)
                 elif resp.status_code in (403, 401):
                     logger.warning(f"Gemini API key denied ({resp.status_code}). Skipping key.")
-                    return None  # Key is denied, don't try other models on it
+                    return None
                 elif resp.status_code == 429:
-                    logger.warning("Gemini rate limit 429 exceeded. Failing over to backup key...")
-                    return None  # Quota exceeded on this key, fail over immediately
+                    logger.warning("Gemini rate limit 429 exceeded. Failing over to next key...")
+                    return None
             except Exception as e:
                 logger.warning(f"Gemini model {model} attempt failed: {e}")
     return None
@@ -325,15 +328,21 @@ async def _call_gemini_with_key(api_key: str, prompt: str) -> Optional[List[Dict
 
 async def _call_gemini_multi_key_fallback(api_keys: List[str], prompt: str) -> Optional[List[Dict[str, Any]]]:
     """
-    Iterates through configured Gemini API keys.
-    If Key 1 hits rate limits (429), errors, or timeouts,
-    it automatically fails over to Key 2 (and subsequent backup keys).
+    Iterates through configured Gemini API keys with round-robin start for concurrency.
+    If Key 1 hits rate limits, it automatically fails over to Key 2 (and subsequent backup keys).
     """
-    for i, key in enumerate(api_keys):
+    global _KEY_INDEX
+    n = len(api_keys)
+    start_idx = _KEY_INDEX % n
+    _KEY_INDEX += 1
+
+    # Try in rotated order to distribute concurrent traffic
+    for i in range(n):
+        key = api_keys[(start_idx + i) % n]
         result = await _call_gemini_with_key(key, prompt)
         if result is not None:
             return result
-        logger.info(f"Gemini Key #{i+1} did not return a valid response. Failing over to next key...")
+        logger.info("Gemini key did not return valid response. Failing over to next key...")
     return None
 
 
@@ -389,8 +398,14 @@ def get_gemini_keys() -> List[str]:
 async def interpret_operator_notes(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
     """
     Translates 1 to 3 operator notes into structured directive dictionaries
-    using multi-key Gemini with seamless failover to Groq and deterministic engine.
+    using multi-key Gemini with seamless failover to Groq, caching, and deterministic engine.
     """
+    # 0. Check in-memory cache to handle concurrent bursts and repeated requests in 0ms!
+    cache_key = f"{'|'.join(operator_notes)}_{battery.capacity_kwh}_{battery.minimum_energy_kwh}"
+    if cache_key in _INTERPRETATION_CACHE:
+        logger.info("Serving directive interpretation from in-memory cache (0ms).")
+        return _INTERPRETATION_CACHE[cache_key]
+
     gemini_keys = get_gemini_keys()
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -407,7 +422,7 @@ Return a JSON object with key "directives": [...]"""
 
     extracted_directives = None
 
-    # Priority 1: Multi-Key Gemini with auto-failover
+    # Priority 1: Multi-Key Gemini with auto-failover & round-robin load distribution
     if gemini_keys and (provider in ("gemini", "") or not groq_key):
         full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
         extracted_directives = await _call_gemini_multi_key_fallback(gemini_keys, full_prompt)
@@ -436,5 +451,9 @@ Return a JSON object with key "directives": [...]"""
     if not extracted_directives or not isinstance(extracted_directives, list):
         logger.info("Using deterministic fallback engine for operator notes.")
         extracted_directives = _rule_based_fallback_parser(operator_notes, battery)
+
+    # Save to in-memory cache
+    if extracted_directives:
+        _INTERPRETATION_CACHE[cache_key] = extracted_directives
 
     return extracted_directives

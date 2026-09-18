@@ -70,6 +70,12 @@ async def global_exception_handler(request: Request, exc: Exception):
     )
 
 
+@app.get("/", tags=["Readiness"])
+async def get_root():
+    """Root endpoint to guarantee 200 OK for any default cloud health pings."""
+    return {"status": "ok", "service": "GridWise Smart Campus Energy Optimization"}
+
+
 @app.get("/health", response_model=HealthResponse, tags=["Readiness"])
 async def get_health():
     """Readiness endpoint for the judging harness."""

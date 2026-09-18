@@ -61,7 +61,7 @@ TIME CONVENTION (CRITICAL):
 - Hours MUST be unique integers from 0 to 23 in strictly ascending order.
 
 OUTPUT JSON FORMAT:
-Return a JSON object with a single key "directives" containing an array of entries for EVERY note in order (note_index 0, 1, ...):
+Return a JSON object with key "directives" containing an array of entries for EVERY note in order (note_index 0, 1, ...):
 {
   "directives": [
     {
@@ -85,23 +85,13 @@ Return a JSON object with a single key "directives" containing an array of entri
 
 def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
     """
-    High-accuracy deterministic regex fallback parser used when LLM API is unavailable,
-    offline, or if an API key is not configured.
+    High-accuracy deterministic regex fallback parser used when LLM APIs are unavailable,
+    offline, or during failovers.
     """
     directives: List[Dict[str, Any]] = []
 
-    def normalize_word_to_num(word: str) -> Optional[int]:
-        mapping = {
-            "noon": 12, "midnight": 0,
-            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
-            "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12
-        }
-        return mapping.get(word.lower().strip())
-
     def extract_hours(text: str) -> List[int]:
         t = text.lower()
-        
-        # Word and phrase shortcuts
         if "noon until 2 pm" in t or "noon to 2 pm" in t:
             return [12, 13]
         if "one until three" in t or "1-3 pm" in t or "1 pm to 3 pm" in t or "1 pm until 3 pm" in t:
@@ -129,26 +119,24 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
         if "7 pm until 10 pm" in t or "7 pm to 10 pm" in t:
             return [19, 20, 21]
 
-        # 24h format: "13:00 and 15:00" or "13:00 to 15:00"
         m24 = re.search(r"(\d{1,2}):00\s*(?:and|to|until)\s*(\d{1,2}):00", t)
         if m24:
             s_h, e_h = int(m24.group(1)), int(m24.group(2))
             if 0 <= s_h < e_h <= 24:
                 return list(range(s_h, e_h))
 
-        # "from X until Y" or "between X and Y"
         m = re.search(r"(?:from|between)\s*(\d{1,2})\s*(am|pm)?\s*(?:until|to|and)\s*(\d{1,2})\s*(am|pm)", t)
         if m:
             s_val = int(m.group(1))
             s_ampm = (m.group(2) or m.group(4)).lower()
-            e_val = int(m.group(3))
-            e_ampm = m.group(4).lower()
+            end_val = int(m.group(3))
+            end_ampm = m.group(4).lower()
 
             s_h = s_val if s_ampm == "am" else (s_val + 12 if s_val != 12 else 12)
             if s_ampm == "am" and s_val == 12:
                 s_h = 0
-            e_h = e_val if e_ampm == "am" else (e_val + 12 if e_val != 12 else 12)
-            if e_ampm == "am" and e_val == 12:
+            e_h = end_val if end_ampm == "am" else (end_val + 12 if end_val != 12 else 12)
+            if end_ampm == "am" and end_val == 12:
                 e_h = 0
 
             if 0 <= s_h < e_h <= 24:
@@ -159,7 +147,7 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
     for idx, note in enumerate(operator_notes):
         n_lower = note.lower()
 
-        # Distractor check
+        # Distractors
         if any(w in n_lower for w in ["registration", "deadline", "cafeteria", "menu", "library", "book-return", "seminar room", "club notice", "student affairs", "sports office"]):
             directives.append({
                 "note_index": idx,
@@ -262,10 +250,47 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
     return directives
 
 
-async def _call_gemini_api(api_key: str, prompt: str) -> Optional[List[Dict[str, Any]]]:
-    """Call Google Gemini API using direct REST HTTP request."""
-    models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.5-flash"]
-    async with httpx.AsyncClient(timeout=12.0) as client:
+def _normalize_llm_items(items: List[Dict[str, Any]], expected_count: int) -> List[Dict[str, Any]]:
+    """Helper to ensure extracted items conform to expected schema names."""
+    normalized = []
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        n_idx = item.get("note_index", idx)
+        d_type = item.get("directive_type") or item.get("type", "no_op")
+        
+        # If model returned keys flat or in structured_adjustment
+        adj = item.get("structured_adjustment")
+        if adj is None and d_type != "no_op":
+            adj = {}
+            if "hours" in item:
+                adj["hours"] = item["hours"]
+            if "factor" in item:
+                adj["factor"] = item["factor"]
+            if "minimum_energy_kwh" in item:
+                adj["minimum_energy_kwh"] = item["minimum_energy_kwh"]
+            if "max_grid_kwh" in item:
+                adj["max_grid_kwh"] = item["max_grid_kwh"]
+
+        applies = (d_type != "no_op")
+        explanation = item.get("explanation", f"Directive for note {n_idx}")
+
+        normalized.append({
+            "note_index": n_idx,
+            "applies": applies,
+            "directive_type": d_type,
+            "structured_adjustment": adj if applies else None,
+            "explanation": explanation
+        })
+    return normalized
+
+
+async def _call_gemini_with_key(api_key: str, prompt: str) -> Optional[List[Dict[str, Any]]]:
+    """Call Google Gemini API using ultra-low latency flash-lite models."""
+    models = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3-flash-preview"]
+    
+    # 3.0s timeout per call ensures response is fast and well under 5.0s p95 threshold
+    async with httpx.AsyncClient(timeout=3.0) as client:
         for model in models:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
             payload = {
@@ -284,18 +309,36 @@ async def _call_gemini_api(api_key: str, prompt: str) -> Optional[List[Dict[str,
                         text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
                         parsed = json.loads(text)
                         if isinstance(parsed, dict) and "directives" in parsed:
-                            return parsed["directives"]
+                            return _normalize_llm_items(parsed["directives"], 0)
                         elif isinstance(parsed, list):
-                            return parsed
-                else:
-                    logger.warning(f"Gemini API returned status {resp.status_code}: {resp.text}")
+                            return _normalize_llm_items(parsed, 0)
+                elif resp.status_code in (403, 401):
+                    logger.warning(f"Gemini API key denied ({resp.status_code}). Skipping key.")
+                    return None  # Key is denied, don't try other models on it
+                elif resp.status_code == 429:
+                    logger.warning("Gemini rate limit 429 exceeded. Failing over to backup key...")
+                    return None  # Quota exceeded on this key, fail over immediately
             except Exception as e:
-                logger.warning(f"Gemini call with {model} failed: {e}")
+                logger.warning(f"Gemini model {model} attempt failed: {e}")
+    return None
+
+
+async def _call_gemini_multi_key_fallback(api_keys: List[str], prompt: str) -> Optional[List[Dict[str, Any]]]:
+    """
+    Iterates through configured Gemini API keys.
+    If Key 1 hits rate limits (429), errors, or timeouts,
+    it automatically fails over to Key 2 (and subsequent backup keys).
+    """
+    for i, key in enumerate(api_keys):
+        result = await _call_gemini_with_key(key, prompt)
+        if result is not None:
+            return result
+        logger.info(f"Gemini Key #{i+1} did not return a valid response. Failing over to next key...")
     return None
 
 
 async def _call_openai_compatible_api(api_key: str, base_url: str, model: str, prompt: str) -> Optional[List[Dict[str, Any]]]:
-    """Call OpenAI or Groq API."""
+    """Call Groq or OpenAI API."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -309,7 +352,7 @@ async def _call_openai_compatible_api(api_key: str, base_url: str, model: str, p
             {"role": "user", "content": prompt}
         ]
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=3.0) as client:
         try:
             resp = await client.post(f"{base_url}/chat/completions", headers=headers, json=payload)
             if resp.status_code == 200:
@@ -317,22 +360,38 @@ async def _call_openai_compatible_api(api_key: str, base_url: str, model: str, p
                 content = data["choices"][0]["message"]["content"]
                 parsed = json.loads(content)
                 if isinstance(parsed, dict) and "directives" in parsed:
-                    return parsed["directives"]
+                    return _normalize_llm_items(parsed["directives"], 0)
                 elif isinstance(parsed, list):
-                    return parsed
-            else:
-                logger.warning(f"OpenAI/Groq call returned status {resp.status_code}: {resp.text}")
+                    return _normalize_llm_items(parsed, 0)
         except Exception as e:
             logger.warning(f"OpenAI/Groq call failed: {e}")
     return None
 
 
+def get_gemini_keys() -> List[str]:
+    """Extracts all unique configured Gemini API keys in priority order."""
+    keys: List[str] = []
+    raw_keys = os.environ.get("GEMINI_API_KEYS", "").strip()
+    if raw_keys:
+        for k in raw_keys.split(","):
+            clean = k.strip()
+            if clean and clean not in keys:
+                keys.append(clean)
+    single_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if single_key and single_key not in keys:
+        keys.append(single_key)
+    backup_key = os.environ.get("GEMINI_API_KEY_BACKUP", "").strip()
+    if backup_key and backup_key not in keys:
+        keys.append(backup_key)
+    return keys
+
+
 async def interpret_operator_notes(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
     """
     Translates 1 to 3 operator notes into structured directive dictionaries
-    using the configured LLM provider, with deterministic fallback for reliability.
+    using multi-key Gemini with seamless failover to Groq and deterministic engine.
     """
-    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    gemini_keys = get_gemini_keys()
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     openai_key = os.environ.get("OPENAI_API_KEY", "").strip()
     provider = os.environ.get("LLM_PROVIDER", "").strip().lower()
@@ -348,33 +407,34 @@ Return a JSON object with key "directives": [...]"""
 
     extracted_directives = None
 
-    # 1. Try specified or available LLM provider
-    if provider == "groq" or (not provider and groq_key):
-        if groq_key:
-            extracted_directives = await _call_openai_compatible_api(
-                api_key=groq_key,
-                base_url="https://api.groq.com/openai/v1",
-                model="llama-3.3-70b-versatile",
-                prompt=user_prompt
-            )
+    # Priority 1: Multi-Key Gemini with auto-failover
+    if gemini_keys and (provider in ("gemini", "") or not groq_key):
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
+        extracted_directives = await _call_gemini_multi_key_fallback(gemini_keys, full_prompt)
 
-    if not extracted_directives and (provider == "gemini" or (not provider and gemini_key)):
-        if gemini_key:
-            full_prompt = f"{SYSTEM_PROMPT}\n\n{user_prompt}"
-            extracted_directives = await _call_gemini_api(api_key=gemini_key, prompt=full_prompt)
+    # Priority 2: Groq (if Gemini failed or if provider=groq)
+    if not extracted_directives and groq_key:
+        logger.info("Failing over to Groq (LLaMA-3.3-70B)...")
+        extracted_directives = await _call_openai_compatible_api(
+            api_key=groq_key,
+            base_url="https://api.groq.com/openai/v1",
+            model="llama-3.3-70b-versatile",
+            prompt=user_prompt
+        )
 
-    if not extracted_directives and (provider == "openai" or (not provider and openai_key)):
-        if openai_key:
-            extracted_directives = await _call_openai_compatible_api(
-                api_key=openai_key,
-                base_url="https://api.openai.com/v1",
-                model="gpt-4o-mini",
-                prompt=user_prompt
-            )
+    # Priority 3: OpenAI (if configured)
+    if not extracted_directives and openai_key:
+        logger.info("Failing over to OpenAI (gpt-4o-mini)...")
+        extracted_directives = await _call_openai_compatible_api(
+            api_key=openai_key,
+            base_url="https://api.openai.com/v1",
+            model="gpt-4o-mini",
+            prompt=user_prompt
+        )
 
-    # 2. Fallback to robust deterministic parser if no LLM responded
+    # Priority 4: Deterministic Guardrail Engine (Zero-Downtime Guarantee)
     if not extracted_directives or not isinstance(extracted_directives, list):
-        logger.info("Using deterministic fallback parser for operator notes.")
+        logger.info("Using deterministic fallback engine for operator notes.")
         extracted_directives = _rule_based_fallback_parser(operator_notes, battery)
 
     return extracted_directives

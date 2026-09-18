@@ -1,0 +1,28 @@
+name: Keep-Alive Heartbeat for Render
+
+on:
+  schedule:
+    # Run every 10 minutes to prevent Render free-tier container sleep (15 min timeout)
+    - cron: "*/10 * * * *"
+  workflow_dispatch: # Allows manual trigger from GitHub Actions tab anytime
+  push:
+    branches:
+      - main
+
+jobs:
+  ping-health:
+    name: Ping /health Endpoint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Service
+        env:
+          SERVICE_URL: ${{ secrets.RENDER_SERVICE_URL || 'https://gridwise-bup-2026.onrender.com' }}
+        run: |
+          echo "Sending keep-alive heartbeat ping to $SERVICE_URL/health..."
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$SERVICE_URL/health" || echo "FAILED")
+          echo "HTTP Response Status Code: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" = "200" ]; then
+            echo "SUCCESS: Render service is warm, awake, and healthy!"
+          else
+            echo "WARNING: Ping returned $HTTP_STATUS. Service may be spinning up."
+          fi

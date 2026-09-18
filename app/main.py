@@ -76,9 +76,10 @@ async def get_root():
     return {"status": "ok", "service": "GridWise Smart Campus Energy Optimization"}
 
 
+@app.get("/healthz", response_model=HealthResponse, tags=["Readiness"])
 @app.get("/health", response_model=HealthResponse, tags=["Readiness"])
 async def get_health():
-    """Readiness endpoint for the judging harness."""
+    """Readiness endpoint for the judging harness and cloud orchestrators."""
     return HealthResponse(status="ok")
 
 

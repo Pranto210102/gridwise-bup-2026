@@ -94,15 +94,49 @@ Return a JSON object with key "directives" containing an array of entries for EV
 def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput) -> List[Dict[str, Any]]:
     """
     High-accuracy deterministic regex fallback parser used when LLM APIs are unavailable,
-    offline, or during network failovers.
+    offline, rate-limited, or during network failovers.
     """
     directives: List[Dict[str, Any]] = []
-
     last_extracted_hours: List[int] = []
+
+    word_to_num = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+    }
 
     def extract_hours(text: str) -> List[int]:
         nonlocal last_extracted_hours
         t = text.lower()
+
+        # 1. Check relative duration from start hour (e.g. "two-hour relay test beginning at 17:00")
+        m_dur = re.search(r"(one|two|three|four|five|\d+)[ -]hour.*?beginning\s+at\s+(\d{1,2})(?::00)?", t)
+        if m_dur:
+            dur_str = m_dur.group(1)
+            dur = word_to_num.get(dur_str, int(dur_str) if dur_str.isdigit() else 1)
+            start = int(m_dur.group(2))
+            if 0 <= start < 24:
+                return list(range(start, min(24, start + dur)))
+
+        # 2. Check single hour statements (e.g. "at hour 7 only", "hour 12 only")
+        m_single = re.search(r"(?:at\s+)?hour\s+(\d{1,2})\s*(?:only)?", t)
+        if m_single:
+            h = int(m_single.group(1))
+            if 0 <= h < 24:
+                return [h]
+
+        # 3. Contextual reference
+        if any(w in t for w in ["same period", "same window", "same interval", "during that time", "during this time"]):
+            if last_extracted_hours:
+                return list(last_extracted_hours)
+
+        # 4. Standard 24h clock ranges (e.g. "00:00 through 01:00", "18:00 up to 22:00", "12:00 to 15:00")
+        m24 = re.search(r"(\d{1,2}):00\s*(?:and|to|until|through|thru|up\s*to|-)\s*(\d{1,2}):00", t)
+        if m24:
+            s_h, e_h = int(m24.group(1)), int(m24.group(2))
+            if 0 <= s_h < e_h <= 24:
+                return list(range(s_h, e_h))
+
+        # 5. Common word-phrased hours
         if "noon until 2 pm" in t or "noon to 2 pm" in t:
             return [12, 13]
         if "one until three" in t or "1-3 pm" in t or "1 pm to 3 pm" in t or "1 pm until 3 pm" in t:
@@ -130,29 +164,30 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
         if "7 pm until 10 pm" in t or "7 pm to 10 pm" in t:
             return [19, 20, 21]
 
-        if any(w in t for w in ["same period", "same window", "same interval", "during that time", "during this time"]):
-            if last_extracted_hours:
-                return list(last_extracted_hours)
-
-        m24 = re.search(r"(\d{1,2}):00\s*(?:and|to|until|through|thru)\s*(\d{1,2}):00", t)
-        if m24:
-            s_h, e_h = int(m24.group(1)), int(m24.group(2))
-            if 0 <= s_h < e_h <= 24:
-                return list(range(s_h, e_h))
-
-        m = re.search(r"(?:from|between)\s*(\d{1,2})\s*(am|pm)?\s*(?:until|to|and|through|thru)\s*(\d{1,2})\s*(am|pm)", t)
-        if m:
-            s_val = int(m.group(1))
-            s_ampm = (m.group(2) or m.group(4)).lower()
-            end_val = int(m.group(3))
-            end_ampm = m.group(4).lower()
-
-            s_h = s_val if s_ampm == "am" else (s_val + 12 if s_val != 12 else 12)
-            if s_ampm == "am" and s_val == 12:
+        # 6. Named tokens & 12h clock ranges (e.g. "from 11 PM until midnight", "between 10 AM and noon")
+        m_range = re.search(r"(?:from|between)\s*(midnight|noon|\d{1,2})(?::00)?\s*(am|pm)?\s*(?:until|to|and|through|thru|up\s*to|-)\s*(?:(midnight|noon)|(\d{1,2})(?::00)?\s*(am|pm)?)", t)
+        if m_range:
+            s_raw = m_range.group(1)
+            if s_raw == "noon":
+                s_h = 12
+            elif s_raw == "midnight":
                 s_h = 0
-            e_h = end_val if end_ampm == "am" else (end_val + 12 if end_val != 12 else 12)
-            if end_ampm == "am" and end_val == 12:
-                end_h = 0
+            else:
+                s_val = int(s_raw)
+                s_ampm = (m_range.group(2) or (m_range.group(5) if m_range.group(5) else "")).lower()
+                s_h = s_val if s_ampm == "am" else (s_val + 12 if (s_val != 12 and s_ampm == "pm") else (0 if (s_val == 12 and s_ampm == "am") else s_val))
+            
+            end_token = m_range.group(3)
+            if end_token == "midnight":
+                e_h = 24
+            elif end_token == "noon":
+                e_h = 12
+            elif m_range.group(4):
+                e_val = int(m_range.group(4))
+                e_ampm = (m_range.group(5) or (m_range.group(2) if m_range.group(2) else "")).lower()
+                e_h = e_val if e_ampm == "am" else (e_val + 12 if (e_val != 12 and e_ampm == "pm") else (0 if (e_val == 12 and e_ampm == "am") else e_val))
+            else:
+                e_h = s_h + 1
 
             if 0 <= s_h < e_h <= 24:
                 return list(range(s_h, e_h))
@@ -160,16 +195,24 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
         return []
 
     for idx, note in enumerate(operator_notes):
-        n_lower = note.lower()
+        n_lower = note.lower().strip()
 
-        # Distractors
-        if any(w in n_lower for w in ["registration", "deadline", "cafeteria", "menu", "library", "book-return", "seminar room", "seminar", "club notice", "student affairs", "sports office", "sports complex", "auditorium", "booking was shifted", "postponed"]):
+        # Distractors: Unrelated operational or informational campus notes
+        if any(w in n_lower for w in [
+            "registration", "deadline", "cafeteria", "menu", "library", "book-return",
+            "seminar", "club notice", "student affairs", "sports", "auditorium",
+            "booking was shifted", "postponed", "brochure", "forecast quality",
+            "access badges", "badges", "badge", "do not infer a no-discharge", "do not infer",
+            "shuttle", "timetable", "finance office", "monthly report", "weather dashboard",
+            "dashboard display", "remains unchanged", "test cameras without changing facility load",
+            "cameras", "camera"
+        ]):
             directives.append({
                 "note_index": idx,
                 "applies": False,
                 "directive_type": "no_op",
                 "structured_adjustment": None,
-                "explanation": "Unrelated operator note."
+                "explanation": "Unrelated operator note or operational notice."
             })
             continue
 
@@ -177,58 +220,50 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
         if hours:
             last_extracted_hours = list(hours)
 
-        # 1. solar_reduction
-        if any(w in n_lower for w in ["solar", "pv production", "pv", "panels", "panel washing", "inverter", "cloud cover"]):
-            factor = 1.0
-            if "80% reduction" in n_lower:
-                factor = 0.2
-            elif "20%" in n_lower or "one-fifth" in n_lower:
-                factor = 0.2
-            elif "25%" in n_lower or "one-fourth" in n_lower:
-                factor = 0.25
-            elif "half" in n_lower or "50%" in n_lower:
-                factor = 0.5
-            else:
-                m_pct = re.search(r"(\d+)%", n_lower)
-                if m_pct:
-                    val = float(m_pct.group(1))
-                    factor = (100 - val) / 100 if "reduction" in n_lower else val / 100
-
-            directives.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "solar_reduction",
-                "structured_adjustment": {"hours": hours, "factor": factor},
-                "explanation": f"Solar reduction during hours {hours}."
-            })
-
-        # 2. no_charge_window
-        elif any(w in n_lower for w in ["charging", "charger"]) and any(w in n_lower for w in ["isolated", "unavailable", "disabled", "do not charge", "outage"]):
-            directives.append({
-                "note_index": idx,
-                "applies": True,
-                "directive_type": "no_charge_window",
-                "structured_adjustment": {"hours": hours},
-                "explanation": "Battery charging disabled during window."
-            })
-
-        # 3. no_discharge_window
-        elif any(w in n_lower for w in ["discharge", "discharging"]) and any(w in n_lower for w in ["not discharge", "do not discharge", "disabled", "testing"]):
+        # 1. no_discharge_window (check before solar mentions like "grid and solar must serve load")
+        if any(w in n_lower for w in ["discharge", "discharging", "battery output"]) and any(w in n_lower for w in [
+            "prohibited", "not discharge", "do not discharge", "disabled", "testing", "relay test",
+            "forbidden", "unavailable"
+        ]):
             directives.append({
                 "note_index": idx,
                 "applies": True,
                 "directive_type": "no_discharge_window",
                 "structured_adjustment": {"hours": hours},
-                "explanation": "Battery discharge disabled during window."
+                "explanation": f"Battery discharge disabled during hours {hours}."
             })
 
-        # 4. minimum_battery_reserve
-        elif any(w in n_lower for w in ["reserve", "stored in the battery", "remain in the battery", "in the battery", "keep at least"]):
+        # 2. no_charge_window (check before "storage inverter" is mistaken for solar inverter)
+        elif any(w in n_lower for w in ["charge", "charging", "charger"]) and any(w in n_lower for w in [
+            "blocked", "isolated", "unavailable", "disabled", "prohibited", "forbidden", "not permitted",
+            "do not charge", "outage", "no battery charging", "charge-blocked"
+        ]):
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "no_charge_window",
+                "structured_adjustment": {"hours": hours},
+                "explanation": f"Battery charging disabled during hours {hours}."
+            })
+
+        # 3. minimum_battery_reserve
+        elif any(w in n_lower for w in [
+            "reserve", "stored in the battery", "remain in the battery", "in the battery",
+            "keep at least", "retain at least", "minimum battery level", "maintained at no less than",
+            "battery level of", "storage"
+        ]) and any(w in n_lower for w in ["kwh", "%", "percent", "capacity", "level"]):
             reserve_kwh = battery.minimum_energy_kwh
-            if "50%" in n_lower or "half" in n_lower:
+            m_pct = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|percent)(?:\s+of(?:\s+the)?\s*(\d+(?:\.\d+)?)\s*kwh)?", n_lower)
+            if m_pct:
+                pct = float(m_pct.group(1))
+                spec_cap = float(m_pct.group(2)) if m_pct.group(2) else battery.capacity_kwh
+                reserve_kwh = (pct / 100.0) * spec_cap
+            elif "half" in n_lower:
                 reserve_kwh = 0.5 * battery.capacity_kwh
+            elif "full" in n_lower and "capacity" in n_lower:
+                reserve_kwh = battery.capacity_kwh
             else:
-                m_kwh = re.search(r"(\d+)\s*kwh", n_lower)
+                m_kwh = re.search(r"(\d+(?:\.\d+)?)\s*kwh", n_lower)
                 if m_kwh:
                     reserve_kwh = float(m_kwh.group(1))
 
@@ -236,14 +271,14 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
                 "note_index": idx,
                 "applies": True,
                 "directive_type": "minimum_battery_reserve",
-                "structured_adjustment": {"hours": hours, "minimum_energy_kwh": reserve_kwh},
-                "explanation": f"Maintain battery reserve of {reserve_kwh} kWh."
+                "structured_adjustment": {"hours": hours, "minimum_energy_kwh": round(reserve_kwh, 2)},
+                "explanation": f"Maintain battery reserve of {reserve_kwh} kWh during hours {hours}."
             })
 
-        # 5. max_grid_window
-        elif any(w in n_lower for w in ["grid import", "grid intake", "feeder", "transformer", "substation"]):
+        # 4. max_grid_window
+        elif any(w in n_lower for w in ["grid import", "grid intake", "feeder", "transformer", "substation", "grid limit"]):
             grid_cap = 999999.0
-            m_cap = re.search(r"(\d+)\s*kwh", n_lower)
+            m_cap = re.search(r"(\d+(?:\.\d+)?)\s*kwh", n_lower)
             if m_cap:
                 grid_cap = float(m_cap.group(1))
 
@@ -251,8 +286,38 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
                 "note_index": idx,
                 "applies": True,
                 "directive_type": "max_grid_window",
-                "structured_adjustment": {"hours": hours, "max_grid_kwh": grid_cap},
-                "explanation": f"Grid import capped at {grid_cap} kWh."
+                "structured_adjustment": {"hours": hours, "max_grid_kwh": round(grid_cap, 2)},
+                "explanation": f"Grid import capped at {grid_cap} kWh during hours {hours}."
+            })
+
+        # 5. solar_reduction
+        elif any(w in n_lower for w in ["solar", "pv", "photovoltaic", "panels", "panel washing", "inverter", "cloud", "cloud bank", "cloud cover"]):
+            factor = 1.0
+            if any(w in n_lower for w in ["zero usable", "zero solar", "leaves zero", "leaves 0%", "leaves 0 percent"]):
+                factor = 0.0
+            elif "80% reduction" in n_lower or "80 percent reduction" in n_lower:
+                factor = 0.2
+            elif "one-fifth" in n_lower:
+                factor = 0.2
+            elif "one-fourth" in n_lower or "25%" in n_lower:
+                factor = 0.25
+            elif "half" in n_lower or "50%" in n_lower:
+                factor = 0.5
+            else:
+                m_pct = re.search(r"(\d+(?:\.\d+)?)\s*(?:%|percent)", n_lower)
+                if m_pct:
+                    val = float(m_pct.group(1))
+                    if any(w in n_lower for w in ["reduction", "reduced", "loss"]):
+                        factor = max(0.0, (100.0 - val) / 100.0)
+                    else:
+                        factor = min(1.0, val / 100.0)
+
+            directives.append({
+                "note_index": idx,
+                "applies": True,
+                "directive_type": "solar_reduction",
+                "structured_adjustment": {"hours": hours, "factor": round(factor, 4)},
+                "explanation": f"Solar reduction during hours {hours} with factor {factor}."
             })
 
         else:

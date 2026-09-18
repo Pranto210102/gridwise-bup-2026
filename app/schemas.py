@@ -41,9 +41,104 @@ class BatteryInput(BaseModel):
 
 class ScenarioRequest(BaseModel):
     scenario_id: str = Field(..., min_length=1, description="Unique scenario identifier")
-    operator_notes: List[str] = Field(..., min_length=1, max_length=3, description="1 to 3 natural-language operator notes")
+    operator_notes: List[str] = Field(..., min_length=1, description="Natural-language operator notes")
     hours: List[HourInput] = Field(..., min_length=24, max_length=24, description="Hourly profile for exactly 24 hours")
     battery: BatteryInput
+
+    @model_validator(mode="before")
+    @classmethod
+    def transform_flat_input(cls, data: Any):
+        if not isinstance(data, dict):
+            return data
+
+        # 0. operator_notes normalization if objects: [{"note_index": 0, "note": "..."}, ...]
+        if "operator_notes" in data and isinstance(data["operator_notes"], list):
+            new_notes = []
+            for item in data["operator_notes"]:
+                if isinstance(item, dict):
+                    new_notes.append(item.get("note") or item.get("text") or str(item))
+                else:
+                    new_notes.append(str(item))
+            data["operator_notes"] = new_notes
+        
+        # 1. Battery conversion if provided as flat fields or system_parameters
+        sys_params = data.get("system_parameters", {})
+        if "battery" not in data:
+            cap = (
+                sys_params.get("battery_capacity_kwh")
+                or sys_params.get("capacity_kwh")
+                or data.get("battery_capacity_kwh")
+                or data.get("capacity_kwh")
+            )
+            init_e = (
+                sys_params.get("initial_battery_energy_kwh")
+                or sys_params.get("initial_battery_kwh")
+                or sys_params.get("initial_energy_kwh")
+                or data.get("initial_battery_kwh")
+                or data.get("initial_battery_energy_kwh")
+                or data.get("initial_energy_kwh", 0)
+            )
+            min_e = (
+                sys_params.get("minimum_battery_energy_kwh")
+                or sys_params.get("minimum_battery_kwh")
+                or sys_params.get("minimum_energy_kwh")
+                or data.get("minimum_battery_kwh")
+                or data.get("minimum_battery_energy_kwh")
+                or data.get("minimum_energy_kwh", 0)
+            )
+            max_c = (
+                sys_params.get("max_charge_rate_kwh")
+                or sys_params.get("max_charge_kwh_per_hour")
+                or data.get("max_charge_rate_kwh")
+                or data.get("max_charge_kwh_per_hour", 0)
+            )
+            max_d = (
+                sys_params.get("max_discharge_rate_kwh")
+                or sys_params.get("max_discharge_kwh_per_hour")
+                or data.get("max_discharge_rate_kwh")
+                or data.get("max_discharge_kwh_per_hour", 0)
+            )
+            if cap is not None:
+                data["battery"] = {
+                    "capacity_kwh": float(cap),
+                    "initial_energy_kwh": float(init_e),
+                    "minimum_energy_kwh": float(min_e),
+                    "max_charge_kwh_per_hour": float(max_c),
+                    "max_discharge_kwh_per_hour": float(max_d),
+                }
+        
+        # 2. Hours conversion if provided as flat lists or dictionaries
+        if "hours" not in data:
+            loads = (
+                data.get("load_kwh")
+                or data.get("hourly_demand_kwh")
+                or data.get("demand_kwh")
+            )
+            solars = (
+                data.get("solar_kwh")
+                or data.get("hourly_solar_kwh")
+            )
+            tariffs = (
+                data.get("tariff_bdt_per_kwh")
+                or data.get("tariffs_bdt_per_kwh")
+                or data.get("tariff_kwh")
+            )
+            
+            if loads is not None and solars is not None and tariffs is not None:
+                hours = []
+                for h in range(24):
+                    h_str = str(h)
+                    d_val = float(loads[h]) if isinstance(loads, list) else float(loads.get(h_str, loads.get(h, 0)))
+                    s_val = float(solars[h]) if isinstance(solars, list) else float(solars.get(h_str, solars.get(h, 0)))
+                    t_val = float(tariffs[h]) if isinstance(tariffs, list) else float(tariffs.get(h_str, tariffs.get(h, 0)))
+                    hours.append({
+                        "hour": h,
+                        "demand_kwh": d_val,
+                        "solar_kwh": s_val,
+                        "tariff_bdt_per_kwh": t_val,
+                    })
+                data["hours"] = hours
+        return data
 
     @field_validator("hours")
     @classmethod

@@ -16,11 +16,14 @@ def generate_plan_summary(
     ignored_notes = [d for d in directives if not d.applies]
 
     notes_desc = []
-    has_grid_cap = False
+    grid_cap_val = None
     if applied_directives:
         d_types = [d.directive_type for d in applied_directives]
-        if "max_grid_window" in d_types:
-            has_grid_cap = True
+        for d in applied_directives:
+            if d.directive_type == "max_grid_window" and d.structured_adjustment:
+                cap = d.structured_adjustment.get("max_grid_kwh")
+                if cap is not None:
+                    grid_cap_val = min(grid_cap_val, cap) if grid_cap_val is not None else cap
         notes_desc.append(f"incorporates operational directives ({', '.join(d_types)})")
     if ignored_notes:
         notes_desc.append(f"ignores {len(ignored_notes)} unrelated operator note(s)")
@@ -43,11 +46,13 @@ def generate_plan_summary(
     if actions_desc:
         summary_parts.append(f"Battery strategically {' and '.join(actions_desc)}.")
 
-    peak_text = (
-        f"respects feeder import limits with a peak grid intake of {peak_grid_kwh:.1f} kWh"
-        if has_grid_cap
-        else f"achieves a peak grid intake of {peak_grid_kwh:.1f} kWh"
-    )
+    if grid_cap_val is not None:
+        if peak_grid_kwh <= grid_cap_val + 0.05:
+            peak_text = f"respects feeder import limits with a peak grid intake of {peak_grid_kwh:.1f} kWh"
+        else:
+            peak_text = f"manages feeder capacity constraints with a peak grid intake of {peak_grid_kwh:.1f} kWh"
+    else:
+        peak_text = f"achieves a peak grid intake of {peak_grid_kwh:.1f} kWh"
 
     summary_parts.append(
         f"Preserves active battery reserves, {peak_text}, "

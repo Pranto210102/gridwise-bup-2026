@@ -5,6 +5,9 @@ import logging
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from app.schemas import BatteryInput
 
@@ -95,7 +98,10 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
     """
     directives: List[Dict[str, Any]] = []
 
+    last_extracted_hours: List[int] = []
+
     def extract_hours(text: str) -> List[int]:
+        nonlocal last_extracted_hours
         t = text.lower()
         if "noon until 2 pm" in t or "noon to 2 pm" in t:
             return [12, 13]
@@ -105,11 +111,11 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
             return [10, 11]
         if "11 am until 1 pm" in t or "11 am to 1 pm" in t:
             return [11, 12]
-        if "11 am and 2 pm" in t or "11 am until 2 pm" in t or "11 am to 2 pm" in t:
+        if "11 am and 2 pm" in t or "11 am until 2 pm" in t or "11 am to 2 pm" in t or "11 am through 2 pm" in t:
             return [11, 12, 13]
         if "2 pm until 4 pm" in t or "2 pm to 4 pm" in t or "between 2 pm and 4 pm" in t:
             return [14, 15]
-        if "2 am until 5 am" in t or "2 am to 5 am" in t:
+        if "2 am until 5 am" in t or "2 am to 5 am" in t or "2 am through 5 am" in t:
             return [2, 3, 4]
         if "5 pm until 7 pm" in t or "5 pm to 7 pm" in t:
             return [17, 18]
@@ -124,13 +130,17 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
         if "7 pm until 10 pm" in t or "7 pm to 10 pm" in t:
             return [19, 20, 21]
 
-        m24 = re.search(r"(\d{1,2}):00\s*(?:and|to|until)\s*(\d{1,2}):00", t)
+        if any(w in t for w in ["same period", "same window", "same interval", "during that time", "during this time"]):
+            if last_extracted_hours:
+                return list(last_extracted_hours)
+
+        m24 = re.search(r"(\d{1,2}):00\s*(?:and|to|until|through|thru)\s*(\d{1,2}):00", t)
         if m24:
             s_h, e_h = int(m24.group(1)), int(m24.group(2))
             if 0 <= s_h < e_h <= 24:
                 return list(range(s_h, e_h))
 
-        m = re.search(r"(?:from|between)\s*(\d{1,2})\s*(am|pm)?\s*(?:until|to|and)\s*(\d{1,2})\s*(am|pm)", t)
+        m = re.search(r"(?:from|between)\s*(\d{1,2})\s*(am|pm)?\s*(?:until|to|and|through|thru)\s*(\d{1,2})\s*(am|pm)", t)
         if m:
             s_val = int(m.group(1))
             s_ampm = (m.group(2) or m.group(4)).lower()
@@ -153,7 +163,7 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
         n_lower = note.lower()
 
         # Distractors
-        if any(w in n_lower for w in ["registration", "deadline", "cafeteria", "menu", "library", "book-return", "seminar room", "club notice", "student affairs", "sports office"]):
+        if any(w in n_lower for w in ["registration", "deadline", "cafeteria", "menu", "library", "book-return", "seminar room", "seminar", "club notice", "student affairs", "sports office", "sports complex", "auditorium", "booking was shifted", "postponed"]):
             directives.append({
                 "note_index": idx,
                 "applies": False,
@@ -164,6 +174,8 @@ def _rule_based_fallback_parser(operator_notes: List[str], battery: BatteryInput
             continue
 
         hours = extract_hours(note)
+        if hours:
+            last_extracted_hours = list(hours)
 
         # 1. solar_reduction
         if any(w in n_lower for w in ["solar", "pv production", "pv", "panels", "panel washing", "inverter", "cloud cover"]):
